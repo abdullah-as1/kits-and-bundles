@@ -1,0 +1,113 @@
+Auth Persistence Layer (APL)
+Auth Persistence Layer (APL) is a technology-agnostic interface for managing auth data of registered Apps. APL provides a common set of operations that can be used by your application and App SDK.
+
+The following doc contains a JavaScript / TypeScript implementation used by official Saleor apps.
+
+The idea of APLs is to abstract specific persistent storage (like Redis, Upstash, or even a file) and provide a common interface for CRUD operations. This way, you can easily switch between different storage solutions without changing the application code. Additionally, app doesn't have to know any platform-specific details about the storage, like connection strings or endpoints.
+
+During development we recommend using FileAPL for fast and easy access on the local machine. For production you need to set up some form of database.
+
+Hint: Specifics of APL is rarely write, but frequent read - it will be checked on every request to the app. We recommend to set up a database with fast read operations, like DynamoDB or Redis.
+
+To increase the security, we recommend to store token encrypted.
+
+AuthData
+Interface containing data used for communication with the Saleor API:
+
+export interface AuthData {
+  // Token that Saleor provides to the app during installation. App must store it securely.
+  token: string;
+  // URL of Saleor GraphQL API, ending with /graphql/. Allows to identify the Saleor instance, especially in multi-tenant apps.
+  saleorApiUrl: string;
+  // ID of the app stored by Saleor in the database. It's unique for each installation. When app is reinstalled, ID will be different.
+  appId: string;
+  // Cached JWKS (JSON Web Key Set) used for webhook validation. It's available at https://<your-saleor-domain>/.well-known/jwks.json
+  jwks: string;
+}
+
+
+Available methods
+get: (saleorApiUrl: string) => Promise<AuthData | undefined> - If the entry for given saleorApiUrl exists, returns AuthData object.
+
+set: (authData: AuthData) => Promise<void> - Save auth data.
+
+delete: (saleorApiUrl: string) => Promise<void> - Remove auth data from the given API URL.
+
+getAll: () => Promise<AuthData[]> - Returns all auth data available.
+
+isReady?: () => Promise<AplReadyResult> - Optional: Check if the persistence layer behind APL is ready. For example, when a database connection was established.
+
+isConfigured?: () => Promise<AplConfiguredResult> - Optional: Check if the persistence layer behind APL is configured. For example, when an env variable is required by the database connection.
+
+AplReadyResult & AplConfiguredResult
+Responses from isReady() and isConfigured() should match following:
+
+type AplReadyResult =
+  | {
+      ready: true;
+    }
+  | {
+      ready: false;
+      error: Error;
+    };
+
+type AplConfiguredResult =
+  | {
+      configured: true;
+    }
+  | {
+      configured: false;
+      error: Error;
+    };
+
+Implementing these functions is optional, but it can be useful for handling asynchronous operations like database connection.
+
+Example implementation
+Let's create an APL which uses Redis for data storage:
+
+import { createClient } from "redis";
+import { APL, AuthData } from "@saleor/app-sdk/apl";
+
+const client = createClient();
+await client.connect();
+
+/**
+ * The APL uses API URL as a key to store and retrieve AuthData.
+ * If you intend to use the same Redis instance for multiple Apps,
+ * add prefix to the keys to avoid overwriting the data by different apps.
+ * Keys will be formatted as below:
+ * - `APPID1:https://other-example.saleor.cloud/graphql`
+ * - `APPID1:https://example.saleor.cloud/graphql/`
+ * - `APPID2:https://example.saleor.cloud/graphql/`
+ **/
+const prepareAuthDataKey = (apiUrl: string) => `${APP_ID}:${apiUrl}`;
+
+const redisAPL: APL = {
+  get: async (saleorApiUrl: string) => {
+    const response = await client.get(prepareAuthDataKey(saleorApiUrl));
+    if (response) {
+      return JSON.parse(response);
+    }
+    return;
+  },
+  set: async (authData: AuthData) => {
+    await client.set(
+      prepareAuthDataKey(authData.saleorApiUrl),
+      JSON.stringify(authData)
+    );
+  },
+  delete: async (saleorApiUrl: string) => {
+    await client.del(prepareAuthDataKey(saleorApiUrl));
+  },
+  getAll: async () => {
+    throw new Exception("Not implemented.");
+  },
+};
+
+You'll be able to use it directly:
+
+import { redisAPL } from "./apl";
+
+const getSavedAuthData = async () => {
+  await redisAPL.get("https://example.saleor.cloud/graphql/");
+};
