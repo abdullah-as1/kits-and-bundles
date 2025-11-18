@@ -1,0 +1,10 @@
+query GetProductDetails($id: ID!, $channel: String!) {
+  product(id: $id, channel: $channel) {
+    id
+    name
+    metadata {
+      key
+      value
+    }
+  }
+}

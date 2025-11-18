@@ -1,0 +1,15 @@
+query GetVariantPrice($id: ID!, $channel: String!) {
+  productVariant(id: $id, channel: $channel) {
+    id
+    name
+    sku
+    pricing {
+      price {
+        gross {
+          amount
+          currency
+        }
+      }
+    }
+  }
+}

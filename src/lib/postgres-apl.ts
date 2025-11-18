@@ -46,14 +46,14 @@ export class PostgresAPL implements APL {
 
       await pool.query(
         `INSERT INTO saleor_app_configuration (tenant, app_name, configurations, updated_at, is_active) 
-         VALUES ($1, $2, $3, NOW(), FALSE) 
+         VALUES ($1, $2, $3, NOW(), TRUE) 
          ON CONFLICT (tenant, app_name) 
-         DO UPDATE SET configurations = $3, updated_at = NOW()`,
+         DO UPDATE SET configurations = $3, updated_at = NOW(), is_active = TRUE`,
         [authData.saleorApiUrl, this.appName, JSON.stringify(authData)]
       );
 
       console.log(
-        `Auth data saved successfully for tenant: ${authData.saleorApiUrl}, app: ${this.appName}`
+        `Auth data saved and activated for tenant: ${authData.saleorApiUrl}, app: ${this.appName}`
       );
     } catch (error) {
       console.error(
@@ -81,6 +81,27 @@ export class PostgresAPL implements APL {
       );
     } catch (error) {
       console.error(`PostgresAPL DELETE error for ${saleorApiUrl}, app: ${this.appName}:`, error);
+      throw error;
+    }
+  }
+
+  async activate(saleorApiUrl: string): Promise<void> {
+    console.log(`=== PostgresAPL ACTIVATE ===`);
+    console.log(`Activating app for tenant: ${saleorApiUrl}, app: ${this.appName}`);
+
+    try {
+      const pool = getPool();
+
+      const result = await pool.query(
+        "UPDATE saleor_app_configuration SET is_active = TRUE, updated_at = NOW() WHERE tenant = $1 AND app_name = $2",
+        [saleorApiUrl, this.appName]
+      );
+
+      console.log(
+        `Activated ${result.rowCount} rows for tenant: ${saleorApiUrl}, app: ${this.appName}`
+      );
+    } catch (error) {
+      console.error(`PostgresAPL ACTIVATE error for ${saleorApiUrl}, app: ${this.appName}:`, error);
       throw error;
     }
   }

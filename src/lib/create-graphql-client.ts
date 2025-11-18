@@ -5,13 +5,12 @@ export const createClient = (url: string, token?: string) =>
     url,
     exchanges: [cacheExchange, fetchExchange],
     fetchOptions: () => {
+      const headers: Record<string, string> = {};
       if (token) {
-        return {
-          headers: {
-            "Authorization-Bearer": token,
-          },
-        };
+        headers["Authorization-Bearer"] = token;
       }
-      return {};
+      console.log("GraphQL Client - URL:", url);
+      console.log("GraphQL Client - Headers:", headers);
+      return { headers };
     },
   });
