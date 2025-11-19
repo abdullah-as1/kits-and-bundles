@@ -20,6 +20,11 @@ export default createManifestHandler({
     const manifest: AppManifest = {
       name: "Kits and Bundles",
       tokenTargetUrl: `${apiBaseURL}/api/register`,
+      brand: {
+        logo: {
+          default: `${apiBaseURL}/logo.png`,
+        },
+      },
       appUrl: iframeBaseUrl,
       /**
        * Set permissions for app if needed
@@ -53,12 +58,7 @@ export default createManifestHandler({
        * https://docs.saleor.io/docs/3.x/developer/extending/apps/extending-dashboard-with-apps
        */
       extensions: [],
-      author: "WSM",
-      brand: {
-        logo: {
-          default: `${apiBaseURL}/image.png`,
-        },
-      },
+      author: "WebShop Manager",
     };
 
     return manifest;
