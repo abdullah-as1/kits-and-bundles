@@ -11,5 +11,6 @@ query GetVariantPrice($id: ID!, $channel: String!) {
         }
       }
     }
+    quantityAvailable
   }
 }

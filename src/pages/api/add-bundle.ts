@@ -55,7 +55,7 @@ export default async function handler(
   const client = createClient(authData.saleorApiUrl, authData.token);
 
   // Validate incoming data
-  const { product_id, bundle_quantity, variants } = req.body;
+  const { product_id, bundle_quantity, variants, checkoutId } = req.body;
 
   if (!product_id) {
     return res.status(400).json({ errorMessage: "product_id is required" });
@@ -159,31 +159,45 @@ export default async function handler(
       }
     }
 
-    // Use variants from the request
-    console.log("Processing variants from request:", variants);
+    // Validate quantity metadata for all requested variants
+    const quantityMeta = product.metadata?.find((m: any) => m.key === 'quantity');
+    const quantityMapping = quantityMeta?.value ? JSON.parse(quantityMeta.value) : {};
+    
+    const missingQuantityVariants = variants.filter((variantId: string) => 
+      !quantityMapping.hasOwnProperty(variantId)
+    );
+    
+    if (missingQuantityVariants.length > 0) {
+      return res.status(400).json({
+        errorMessage: `The quantity for variant(s) ${missingQuantityVariants.join(', ')} is not set`,
+        missingQuantityVariants: missingQuantityVariants
+      });
+    }
 
-    // Fetch details for each variant
-    const variantQuery = `
-      query GetVariantPrice($id: ID!, $channel: String!) {
-        productVariant(id: $id, channel: $channel) {
-          id
-          name
-          sku
-          pricing {
-            price {
-              gross {
-                amount
-                currency
+    const pricingMethod = presentPricingMethods[0];
+    
+    if (pricingMethod === 'noDiscount') {
+      // Fetch variant details and prices
+      const variantQuery = `
+        query GetVariantPrice($id: ID!, $channel: String!) {
+          productVariant(id: $id, channel: $channel) {
+            id
+            name
+            quantityAvailable
+            pricing {
+              price {
+                gross {
+                  amount
+                  currency
+                }
               }
             }
           }
         }
-      }
-    `;
+      `;
 
-    const variantDetails = [];
-    for (const variantId of variants) {
-      try {
+      const variantDetails = [];
+      for (const variantId of variants) {
         const variantResponse = await fetch(authData.saleorApiUrl, {
           method: 'POST',
           headers: {
@@ -192,31 +206,887 @@ export default async function handler(
           },
           body: JSON.stringify({
             query: variantQuery,
-            variables: {
-              id: variantId,
-              channel: DEFAULT_CHANNEL
-            }
+            variables: { id: variantId, channel: DEFAULT_CHANNEL }
           })
         });
 
         const variantResult = await variantResponse.json();
-        
         if (variantResult.data?.productVariant) {
-          variantDetails.push(variantResult.data.productVariant);
-          console.log(`Variant ${variantId} Details:`, JSON.stringify(variantResult.data.productVariant, null, 2));
+          const variant = variantResult.data.productVariant;
+          
+          // Check stock availability
+          if (variant.quantityAvailable === 0) {
+            return res.status(400).json({ errorMessage: "Out of stock" });
+          }
+          
+          variantDetails.push(variant);
         } else {
-          console.log(`Variant ${variantId} not found or error:`, variantResult.errors);
+          return res.status(400).json({ errorMessage: `Variant ${variantId} not found` });
         }
-      } catch (error) {
-        console.error(`Error fetching variant ${variantId}:`, error);
       }
+
+      // Create checkout
+      const createCheckoutMutation = `
+        mutation CreateExampleCheckout($input: CheckoutCreateInput!) {
+          checkoutCreate(input: $input) {
+            checkout {
+              id
+              token
+              lines {
+                id
+                variant { id }
+              }
+            }
+          }
+        }
+      `;
+
+      // Get quantity mapping from product metadata
+      const quantityMeta = product.metadata?.find((m: any) => m.key === 'quantity');
+      const quantityMapping = quantityMeta?.value ? JSON.parse(quantityMeta.value) : {};
+
+      const checkoutLines = variantDetails.map(variant => {
+        const variantQuantity = parseInt(quantityMapping[variant.id] || '1');
+        const totalQuantity = variantQuantity * bundle_quantity;
+        
+        return {
+          variantId: variant.id,
+          quantity: totalQuantity,
+          price: variant.pricing.price.gross.amount
+        };
+      });
+
+      // Create or add to checkout
+      let checkout;
+      let newLineIds = [];
+      
+      if (!checkoutId) {
+        // Create new checkout
+        const createCheckoutMutation = `
+          mutation CreateExampleCheckout($input: CheckoutCreateInput!) {
+            checkoutCreate(input: $input) {
+              checkout {
+                id
+                token
+                lines {
+                  id
+                  variant { id }
+                }
+              }
+            }
+          }
+        `;
+
+        const checkoutResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: createCheckoutMutation,
+            variables: {
+              input: {
+                channel: DEFAULT_CHANNEL,
+                lines: checkoutLines
+              }
+            }
+          })
+        });
+
+        const checkoutResult = await checkoutResponse.json();
+        if (checkoutResult.errors) {
+          return res.status(400).json({ errorMessage: `Checkout creation failed: ${checkoutResult.errors.map((e: any) => e.message).join(', ')}` });
+        }
+
+        checkout = checkoutResult.data?.checkoutCreate?.checkout;
+        newLineIds = checkout?.lines?.map((line: any) => line.id) || [];
+      } else {
+        // Get existing line IDs first
+        const existingLinesQuery = `
+          query GetExistingLines($id: ID!) {
+            checkout(id: $id) {
+              lines {
+                id
+              }
+            }
+          }
+        `;
+
+        const existingResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: existingLinesQuery,
+            variables: { id: checkoutId }
+          })
+        });
+
+        const existingResult = await existingResponse.json();
+        const existingLineIds = existingResult.data?.checkout?.lines?.map((line: any) => line.id) || [];
+
+        // Add to existing checkout
+        const addLinesToCheckoutMutation = `
+          mutation AddLinesToCheckout($id: ID!, $lines: [CheckoutLineInput!]!) {
+            checkoutLinesAdd(id: $id, lines: $lines) {
+              checkout {
+                id
+                token
+                lines {
+                  id
+                  variant { id }
+                }
+              }
+            }
+          }
+        `;
+
+        const addLinesResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: addLinesToCheckoutMutation,
+            variables: {
+              id: checkoutId,
+              lines: checkoutLines
+            }
+          })
+        });
+
+        const addLinesResult = await addLinesResponse.json();
+        if (addLinesResult.errors) {
+          return res.status(400).json({ errorMessage: `Adding lines failed: ${addLinesResult.errors.map((e: any) => e.message).join(', ')}` });
+        }
+
+        checkout = addLinesResult.data?.checkoutLinesAdd?.checkout;
+        
+        // Find new line IDs by comparing with existing ones
+        const allLineIds = checkout?.lines?.map((line: any) => line.id) || [];
+        newLineIds = allLineIds.filter(id => !existingLineIds.includes(id));
+      }
+      
+      if (!checkout) {
+        return res.status(400).json({ errorMessage: "Failed to create checkout" });
+      }
+
+      // Add metadata only to newly added lines
+      const requiredMeta = product.metadata?.find((m: any) => m.key === 'required');
+      const optionalMeta = product.metadata?.find((m: any) => m.key === 'optional');
+      const requiredVariants = requiredMeta?.value ? JSON.parse(requiredMeta.value) : [];
+      const optionalVariants = optionalMeta?.value ? Object.keys(JSON.parse(optionalMeta.value)) : [];
+
+      const updateMetadataMutation = `
+        mutation UpdateMetadata($id: ID!, $input: [MetadataInput!]!) {
+          updateMetadata(id: $id, input: $input) {
+            errors { message }
+          }
+        }
+      `;
+
+      // Only update metadata for new lines
+      for (const line of checkout.lines) {
+        if (newLineIds.includes(line.id)) {
+          const isRequired = requiredVariants.includes(line.variant.id);
+          const isOptional = optionalVariants.includes(line.variant.id);
+          
+          const status = isRequired ? 'required' : (isOptional ? 'optional' : 'unknown');
+          const message = isRequired 
+            ? 'This variant is required in the bundle and cannot be removed from the cart. Remove the whole bundle from the cart.'
+            : 'This product is optional and can be removed from the bundle.';
+
+          await fetch(authData.saleorApiUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization-Bearer': authData.token,
+            },
+            body: JSON.stringify({
+              query: updateMetadataMutation,
+              variables: {
+                id: line.id,
+                input: [
+                  { key: 'bundle', value: product.name },
+                  { key: 'required_or_optional', value: status },
+                  { key: 'message', value: message }
+                ]
+              }
+            })
+          });
+        }
+      }
+
+      // Add bundle_quantity metadata to checkout
+      const checkoutMetadataQuery = `
+        query GetCheckoutMetadata($id: ID!) {
+          checkout(id: $id) {
+            metadata {
+              key
+              value
+            }
+          }
+        }
+      `;
+
+      // Get existing checkout metadata
+      const metadataResponse = await fetch(authData.saleorApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization-Bearer': authData.token,
+        },
+        body: JSON.stringify({
+          query: checkoutMetadataQuery,
+          variables: { id: checkout.id }
+        })
+      });
+
+      const metadataResult = await metadataResponse.json();
+      const existingMetadata = metadataResult.data?.checkout?.metadata || [];
+      
+      // Find existing bundle_quantity metadata
+      const bundleQuantityMeta = existingMetadata.find((m: any) => m.key === 'bundle_quantity');
+      let bundleQuantities = {};
+      
+      if (bundleQuantityMeta?.value) {
+        bundleQuantities = JSON.parse(bundleQuantityMeta.value);
+      }
+      
+      // Update with current bundle
+      bundleQuantities[product.name] = (bundleQuantities[product.name] || 0) + bundle_quantity;
+
+      // Update checkout metadata
+      await fetch(authData.saleorApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization-Bearer': authData.token,
+        },
+        body: JSON.stringify({
+          query: updateMetadataMutation,
+          variables: {
+            id: checkout.id,
+            input: [
+              { key: 'bundle_quantity', value: JSON.stringify(bundleQuantities) }
+            ]
+          }
+        })
+      });
+
+      return res.status(200).json({ 
+        message: "Bundle checkout created successfully with noDiscount pricing",
+        checkout: checkout
+      });
     }
 
-    return res.status(200).json({ 
-      message: "Bundle processed successfully",
-      productData: product,
-      variantDetails: variantDetails
-    });
+    if (pricingMethod === 'fixedPrice') {
+      // Get fixed price and optional prices
+      const fixedPriceMeta = product.metadata?.find((m: any) => m.key === 'fixedPrice');
+      const optionalMeta = product.metadata?.find((m: any) => m.key === 'optional');
+      const requiredMeta = product.metadata?.find((m: any) => m.key === 'required');
+      
+      const bundlePrice = parseFloat(fixedPriceMeta?.value || '0');
+      const optionalPrices = optionalMeta?.value ? JSON.parse(optionalMeta.value) : {};
+      const requiredVariants = requiredMeta?.value ? JSON.parse(requiredMeta.value) : [];
+
+      // Fetch variant details
+      const variantQuery = `
+        query GetVariantPrice($id: ID!, $channel: String!) {
+          productVariant(id: $id, channel: $channel) {
+            id
+            name
+            quantityAvailable
+            pricing {
+              price {
+                gross {
+                  amount
+                  currency
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const variantDetails = [];
+      for (const variantId of variants) {
+        const variantResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: variantQuery,
+            variables: { id: variantId, channel: DEFAULT_CHANNEL }
+          })
+        });
+
+        const variantResult = await variantResponse.json();
+        if (variantResult.data?.productVariant) {
+          const variant = variantResult.data.productVariant;
+          
+          // Check stock availability
+          if (variant.quantityAvailable === 0) {
+            return res.status(400).json({ errorMessage: "Out of stock" });
+          }
+          
+          variantDetails.push(variant);
+        } else {
+          return res.status(400).json({ errorMessage: `Variant ${variantId} not found` });
+        }
+      }
+
+      // Calculate proportional prices for required variants
+      const requiredVariantDetails = variantDetails.filter(v => requiredVariants.includes(v.id));
+      const totalOriginalPrice = requiredVariantDetails.reduce((sum, v) => sum + v.pricing.price.gross.amount, 0);
+
+      // Get quantity mapping
+      const quantityMeta = product.metadata?.find((m: any) => m.key === 'quantity');
+      const quantityMapping = quantityMeta?.value ? JSON.parse(quantityMeta.value) : {};
+
+      const checkoutLines = variantDetails.map(variant => {
+        const variantQuantity = parseInt(quantityMapping[variant.id] || '1');
+        const totalQuantity = variantQuantity * bundle_quantity;
+        
+        let price;
+        if (requiredVariants.includes(variant.id)) {
+          // Proportional allocation for required variants, divided by quantity
+          const weight = variant.pricing.price.gross.amount / totalOriginalPrice;
+          price = (bundlePrice * weight) / variantQuantity;
+        } else {
+          // Direct price for optional variants, divided by quantity
+          const optionalPrice = parseFloat(optionalPrices[variant.id] || variant.pricing.price.gross.amount);
+          price = optionalPrice / variantQuantity;
+        }
+        
+        return {
+          variantId: variant.id,
+          quantity: totalQuantity,
+          price: price
+        };
+      });
+
+      // Create or add to checkout
+      let checkout;
+      let newLineIds = [];
+      
+      if (!checkoutId) {
+        const createCheckoutMutation = `
+          mutation CreateExampleCheckout($input: CheckoutCreateInput!) {
+            checkoutCreate(input: $input) {
+              checkout {
+                id
+                token
+                lines {
+                  id
+                  variant { id }
+                }
+              }
+            }
+          }
+        `;
+
+        const checkoutResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: createCheckoutMutation,
+            variables: {
+              input: {
+                channel: DEFAULT_CHANNEL,
+                lines: checkoutLines
+              }
+            }
+          })
+        });
+
+        const checkoutResult = await checkoutResponse.json();
+        if (checkoutResult.errors) {
+          return res.status(400).json({ errorMessage: `Checkout creation failed: ${checkoutResult.errors.map((e: any) => e.message).join(', ')}` });
+        }
+
+        checkout = checkoutResult.data?.checkoutCreate?.checkout;
+        newLineIds = checkout?.lines?.map((line: any) => line.id) || [];
+      } else {
+        // Get existing line IDs first
+        const existingLinesQuery = `
+          query GetExistingLines($id: ID!) {
+            checkout(id: $id) {
+              lines {
+                id
+              }
+            }
+          }
+        `;
+
+        const existingResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: existingLinesQuery,
+            variables: { id: checkoutId }
+          })
+        });
+
+        const existingResult = await existingResponse.json();
+        const existingLineIds = existingResult.data?.checkout?.lines?.map((line: any) => line.id) || [];
+
+        const addLinesToCheckoutMutation = `
+          mutation AddLinesToCheckout($id: ID!, $lines: [CheckoutLineInput!]!) {
+            checkoutLinesAdd(id: $id, lines: $lines) {
+              checkout {
+                id
+                token
+                lines {
+                  id
+                  variant { id }
+                }
+              }
+            }
+          }
+        `;
+
+        const addLinesResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: addLinesToCheckoutMutation,
+            variables: {
+              id: checkoutId,
+              lines: checkoutLines
+            }
+          })
+        });
+
+        const addLinesResult = await addLinesResponse.json();
+        if (addLinesResult.errors) {
+          return res.status(400).json({ errorMessage: `Adding lines failed: ${addLinesResult.errors.map((e: any) => e.message).join(', ')}` });
+        }
+
+        checkout = addLinesResult.data?.checkoutLinesAdd?.checkout;
+        
+        // Find new line IDs by comparing with existing ones
+        const allLineIds = checkout?.lines?.map((line: any) => line.id) || [];
+        newLineIds = allLineIds.filter(id => !existingLineIds.includes(id));
+      }
+      
+      if (!checkout) {
+        return res.status(400).json({ errorMessage: "Failed to create checkout" });
+      }
+
+      // Add metadata to checkout lines (only new lines)
+      const requiredVariantsForMeta = requiredMeta?.value ? JSON.parse(requiredMeta.value) : [];
+      const optionalVariantsForMeta = optionalMeta?.value ? Object.keys(JSON.parse(optionalMeta.value)) : [];
+
+      const updateMetadataMutation = `
+        mutation UpdateMetadata($id: ID!, $input: [MetadataInput!]!) {
+          updateMetadata(id: $id, input: $input) {
+            errors { message }
+          }
+        }
+      `;
+
+      // Only update metadata for new lines
+      for (const line of checkout.lines) {
+        if (newLineIds.includes(line.id)) {
+          const isRequired = requiredVariantsForMeta.includes(line.variant.id);
+          const isOptional = optionalVariantsForMeta.includes(line.variant.id);
+          
+          const status = isRequired ? 'required' : (isOptional ? 'optional' : 'unknown');
+          const message = isRequired 
+            ? 'This variant is required in the bundle and cannot be removed from the cart. Remove the whole bundle from the cart.'
+            : 'This product is optional and can be removed from the bundle.';
+
+          await fetch(authData.saleorApiUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization-Bearer': authData.token,
+            },
+            body: JSON.stringify({
+              query: updateMetadataMutation,
+              variables: {
+                id: line.id,
+                input: [
+                  { key: 'bundle', value: product.name },
+                  { key: 'required_or_optional', value: status },
+                  { key: 'message', value: message }
+                ]
+              }
+            })
+          });
+        }
+      }
+
+      // Add bundle_quantity metadata to checkout
+      const checkoutMetadataQuery = `
+        query GetCheckoutMetadata($id: ID!) {
+          checkout(id: $id) {
+            metadata {
+              key
+              value
+            }
+          }
+        }
+      `;
+
+      const metadataResponse = await fetch(authData.saleorApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization-Bearer': authData.token,
+        },
+        body: JSON.stringify({
+          query: checkoutMetadataQuery,
+          variables: { id: checkout.id }
+        })
+      });
+
+      const metadataResult = await metadataResponse.json();
+      const existingMetadata = metadataResult.data?.checkout?.metadata || [];
+      
+      const bundleQuantityMeta = existingMetadata.find((m: any) => m.key === 'bundle_quantity');
+      let bundleQuantities = {};
+      
+      if (bundleQuantityMeta?.value) {
+        bundleQuantities = JSON.parse(bundleQuantityMeta.value);
+      }
+      
+      bundleQuantities[product.name] = (bundleQuantities[product.name] || 0) + bundle_quantity;
+
+      await fetch(authData.saleorApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization-Bearer': authData.token,
+        },
+        body: JSON.stringify({
+          query: updateMetadataMutation,
+          variables: {
+            id: checkout.id,
+            input: [
+              { key: 'bundle_quantity', value: JSON.stringify(bundleQuantities) }
+            ]
+          }
+        })
+      });
+
+      return res.status(200).json({ 
+        message: "Bundle checkout created successfully with fixedPrice pricing",
+        checkout: checkout
+      });
+    }
+
+    if (pricingMethod === 'discountedSum') {
+      // Get discount percentage
+      const discountMeta = product.metadata?.find((m: any) => m.key === 'discountedSum');
+      const discountPercent = parseFloat(discountMeta?.value || '0');
+
+      // Fetch variant details
+      const variantQuery = `
+        query GetVariantPrice($id: ID!, $channel: String!) {
+          productVariant(id: $id, channel: $channel) {
+            id
+            name
+            quantityAvailable
+            pricing {
+              price {
+                gross {
+                  amount
+                  currency
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const variantDetails = [];
+      for (const variantId of variants) {
+        const variantResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: variantQuery,
+            variables: { id: variantId, channel: DEFAULT_CHANNEL }
+          })
+        });
+
+        const variantResult = await variantResponse.json();
+        if (variantResult.data?.productVariant) {
+          const variant = variantResult.data.productVariant;
+          
+          // Check stock availability
+          if (variant.quantityAvailable === 0) {
+            return res.status(400).json({ errorMessage: "Out of stock" });
+          }
+          
+          variantDetails.push(variant);
+        } else {
+          return res.status(400).json({ errorMessage: `Variant ${variantId} not found` });
+        }
+      }
+
+      // Get quantity mapping
+      const quantityMeta = product.metadata?.find((m: any) => m.key === 'quantity');
+      const quantityMapping = quantityMeta?.value ? JSON.parse(quantityMeta.value) : {};
+
+      const checkoutLines = variantDetails.map(variant => {
+        const variantQuantity = parseInt(quantityMapping[variant.id] || '1');
+        const totalQuantity = variantQuantity * bundle_quantity;
+        
+        // Apply discount to original price
+        const originalPrice = variant.pricing.price.gross.amount;
+        const discountedPrice = originalPrice * (1 - discountPercent / 100);
+        
+        return {
+          variantId: variant.id,
+          quantity: totalQuantity,
+          price: discountedPrice
+        };
+      });
+
+      // Create or add to checkout
+      let checkout;
+      let newLineIds = [];
+      
+      if (!checkoutId) {
+        const createCheckoutMutation = `
+          mutation CreateExampleCheckout($input: CheckoutCreateInput!) {
+            checkoutCreate(input: $input) {
+              checkout {
+                id
+                token
+                lines {
+                  id
+                  variant { id }
+                }
+              }
+            }
+          }
+        `;
+
+        const checkoutResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: createCheckoutMutation,
+            variables: {
+              input: {
+                channel: DEFAULT_CHANNEL,
+                lines: checkoutLines
+              }
+            }
+          })
+        });
+
+        const checkoutResult = await checkoutResponse.json();
+        if (checkoutResult.errors) {
+          return res.status(400).json({ errorMessage: `Checkout creation failed: ${checkoutResult.errors.map((e: any) => e.message).join(', ')}` });
+        }
+
+        checkout = checkoutResult.data?.checkoutCreate?.checkout;
+        newLineIds = checkout?.lines?.map((line: any) => line.id) || [];
+      } else {
+        // Get existing line IDs first
+        const existingLinesQuery = `
+          query GetExistingLines($id: ID!) {
+            checkout(id: $id) {
+              lines {
+                id
+              }
+            }
+          }
+        `;
+
+        const existingResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: existingLinesQuery,
+            variables: { id: checkoutId }
+          })
+        });
+
+        const existingResult = await existingResponse.json();
+        const existingLineIds = existingResult.data?.checkout?.lines?.map((line: any) => line.id) || [];
+
+        const addLinesToCheckoutMutation = `
+          mutation AddLinesToCheckout($id: ID!, $lines: [CheckoutLineInput!]!) {
+            checkoutLinesAdd(id: $id, lines: $lines) {
+              checkout {
+                id
+                token
+                lines {
+                  id
+                  variant { id }
+                }
+              }
+            }
+          }
+        `;
+
+        const addLinesResponse = await fetch(authData.saleorApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization-Bearer': authData.token,
+          },
+          body: JSON.stringify({
+            query: addLinesToCheckoutMutation,
+            variables: {
+              id: checkoutId,
+              lines: checkoutLines
+            }
+          })
+        });
+
+        const addLinesResult = await addLinesResponse.json();
+        if (addLinesResult.errors) {
+          return res.status(400).json({ errorMessage: `Adding lines failed: ${addLinesResult.errors.map((e: any) => e.message).join(', ')}` });
+        }
+
+        checkout = addLinesResult.data?.checkoutLinesAdd?.checkout;
+        
+        // Find new line IDs by comparing with existing ones
+        const allLineIds = checkout?.lines?.map((line: any) => line.id) || [];
+        newLineIds = allLineIds.filter(id => !existingLineIds.includes(id));
+      }
+      
+      if (!checkout) {
+        return res.status(400).json({ errorMessage: "Failed to create checkout" });
+      }
+
+      // Add metadata to checkout lines (only new lines)
+      const requiredMeta = product.metadata?.find((m: any) => m.key === 'required');
+      const optionalMeta = product.metadata?.find((m: any) => m.key === 'optional');
+      const requiredVariantsForMeta = requiredMeta?.value ? JSON.parse(requiredMeta.value) : [];
+      const optionalVariantsForMeta = optionalMeta?.value ? Object.keys(JSON.parse(optionalMeta.value)) : [];
+
+      const updateMetadataMutation = `
+        mutation UpdateMetadata($id: ID!, $input: [MetadataInput!]!) {
+          updateMetadata(id: $id, input: $input) {
+            errors { message }
+          }
+        }
+      `;
+
+      // Only update metadata for new lines
+      for (const line of checkout.lines) {
+        if (newLineIds.includes(line.id)) {
+          const isRequired = requiredVariantsForMeta.includes(line.variant.id);
+          const isOptional = optionalVariantsForMeta.includes(line.variant.id);
+          
+          const status = isRequired ? 'required' : (isOptional ? 'optional' : 'unknown');
+          const message = isRequired 
+            ? 'This variant is required in the bundle and cannot be removed from the cart. Remove the whole bundle from the cart.'
+            : 'This product is optional and can be removed from the bundle.';
+
+          await fetch(authData.saleorApiUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization-Bearer': authData.token,
+            },
+            body: JSON.stringify({
+              query: updateMetadataMutation,
+              variables: {
+                id: line.id,
+                input: [
+                  { key: 'bundle', value: product.name },
+                  { key: 'required_or_optional', value: status },
+                  { key: 'message', value: message }
+                ]
+              }
+            })
+          });
+        }
+      }
+
+      // Add bundle_quantity metadata to checkout
+      const checkoutMetadataQuery = `
+        query GetCheckoutMetadata($id: ID!) {
+          checkout(id: $id) {
+            metadata {
+              key
+              value
+            }
+          }
+        }
+      `;
+
+      const metadataResponse = await fetch(authData.saleorApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization-Bearer': authData.token,
+        },
+        body: JSON.stringify({
+          query: checkoutMetadataQuery,
+          variables: { id: checkout.id }
+        })
+      });
+
+      const metadataResult = await metadataResponse.json();
+      const existingMetadata = metadataResult.data?.checkout?.metadata || [];
+      
+      const bundleQuantityMeta = existingMetadata.find((m: any) => m.key === 'bundle_quantity');
+      let bundleQuantities = {};
+      
+      if (bundleQuantityMeta?.value) {
+        bundleQuantities = JSON.parse(bundleQuantityMeta.value);
+      }
+      
+      bundleQuantities[product.name] = (bundleQuantities[product.name] || 0) + bundle_quantity;
+
+      await fetch(authData.saleorApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization-Bearer': authData.token,
+        },
+        body: JSON.stringify({
+          query: updateMetadataMutation,
+          variables: {
+            id: checkout.id,
+            input: [
+              { key: 'bundle_quantity', value: JSON.stringify(bundleQuantities) }
+            ]
+          }
+        })
+      });
+
+      return res.status(200).json({ 
+        message: "Bundle checkout created successfully with discountedSum pricing",
+        checkout: checkout
+      });
+    }
+
+    return res.status(400).json({ errorMessage: `Pricing method ${pricingMethod} not implemented` });
 
   } catch (error) {
     console.error("Unexpected error:", error);
