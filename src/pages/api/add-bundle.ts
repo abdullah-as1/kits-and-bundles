@@ -6,11 +6,15 @@ import { apl } from "../../saleor-app";
 
 type SuccessfulResponse = {
   message: string;
-  productData: any;
+  productData?: any;
+  checkout?: any;
 };
 
 type ErrorResponse = {
   errorMessage: string;
+  foundMethods?: string[];
+  missingVariants?: any;
+  missingQuantityVariants?: any[];
 };
 
 export type AddBundleResponseData = SuccessfulResponse | ErrorResponse;
@@ -368,7 +372,7 @@ export default async function handler(
         
         // Find new line IDs by comparing with existing ones
         const allLineIds = checkout?.lines?.map((line: any) => line.id) || [];
-        newLineIds = allLineIds.filter(id => !existingLineIds.includes(id));
+        newLineIds = allLineIds.filter((id: string) => !existingLineIds.includes(id));
       }
       
       if (!checkout) {
@@ -451,7 +455,7 @@ export default async function handler(
       
       // Find existing bundle_quantity metadata
       const bundleQuantityMeta = existingMetadata.find((m: any) => m.key === 'bundle_quantity');
-      let bundleQuantities = {};
+      let bundleQuantities: { [key: string]: number } = {};
       
       if (bundleQuantityMeta?.value) {
         bundleQuantities = JSON.parse(bundleQuantityMeta.value);
@@ -682,7 +686,7 @@ export default async function handler(
         
         // Find new line IDs by comparing with existing ones
         const allLineIds = checkout?.lines?.map((line: any) => line.id) || [];
-        newLineIds = allLineIds.filter(id => !existingLineIds.includes(id));
+        newLineIds = allLineIds.filter((id: string) => !existingLineIds.includes(id));
       }
       
       if (!checkout) {
@@ -761,7 +765,7 @@ export default async function handler(
       const existingMetadata = metadataResult.data?.checkout?.metadata || [];
       
       const bundleQuantityMeta = existingMetadata.find((m: any) => m.key === 'bundle_quantity');
-      let bundleQuantities = {};
+      let bundleQuantities: { [key: string]: number } = {};
       
       if (bundleQuantityMeta?.value) {
         bundleQuantities = JSON.parse(bundleQuantityMeta.value);
@@ -974,7 +978,7 @@ export default async function handler(
         
         // Find new line IDs by comparing with existing ones
         const allLineIds = checkout?.lines?.map((line: any) => line.id) || [];
-        newLineIds = allLineIds.filter(id => !existingLineIds.includes(id));
+        newLineIds = allLineIds.filter((id: string) => !existingLineIds.includes(id));
       }
       
       if (!checkout) {
@@ -1055,7 +1059,7 @@ export default async function handler(
       const existingMetadata = metadataResult.data?.checkout?.metadata || [];
       
       const bundleQuantityMeta = existingMetadata.find((m: any) => m.key === 'bundle_quantity');
-      let bundleQuantities = {};
+      let bundleQuantities: { [key: string]: number } = {};
       
       if (bundleQuantityMeta?.value) {
         bundleQuantities = JSON.parse(bundleQuantityMeta.value);
